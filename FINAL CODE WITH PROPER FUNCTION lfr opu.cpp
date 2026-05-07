@@ -22,12 +22,16 @@
 #define SOIL_MOISTURE_PIN 36
 
 // Relay Module (Active LOW)
-#define RELAY_PIN 26
+#define RELAY_PIN 33
 
 // Soil Moisture Thresholds - FIXED for your values
 #define DRY_THRESHOLD 3000 // Dry if reading >= 3000
 #define WET_THRESHOLD 2600 // Wet if reading <= 2600
 #define NUM_READINGS 10
+
+// Pump timing configuration
+#define PUMP_DURATION 5000  // Pump runs for 5 seconds
+#define PUMP_DELAY_BEFORE_ON 2000  // Wait 2 seconds before turning pump ON
 
 // Servo Angles
 #define SERVO_UP_ANGLE 90
@@ -47,6 +51,8 @@ unsigned long pauseStartTime = 0;
 bool checkingMoisture = false;
 bool servoDown = false;
 unsigned long moistureCheckStartTime = 0;
+bool pumpActivated = false;
+unsigned long pumpStartTime = 0;
 
 void setup()
 {
@@ -69,7 +75,7 @@ void setup()
 
   // Initialize relay
   pinMode(RELAY_PIN, OUTPUT);
-  digitalWrite(RELAY_PIN, HIGH); // Relay OFF (Active LOW)
+  digitalWrite(RELAY_PIN, LOW); // Relay OFF (Active LOW)
 
   // Initialize servo
   myServo.attach(SERVO_PIN);
@@ -79,7 +85,12 @@ void setup()
 
   Serial.println("=== SIMPLE LINE FOLLOWER WITH SOIL MOISTURE ===");
   Serial.println("Testing sensors first...");
-  Serial.println("Soil moisture thresholds: DRY >= 3000, WET <= 2600");
+  Serial.print("Soil moisture thresholds: DRY >= 3000, WET <= 2600");
+  Serial.print(" | Pump will start after: ");
+  Serial.print(PUMP_DELAY_BEFORE_ON / 1000);
+  Serial.print(" seconds | Pump runs for: ");
+  Serial.print(PUMP_DURATION / 1000);
+  Serial.println(" seconds");
 }
 
 void loop()
@@ -153,6 +164,7 @@ void loop()
       // Start moisture checking sequence
       checkingMoisture = true;
       servoDown = false;
+      pumpActivated = false;
       moistureCheckStartTime = millis();
     }
   }
@@ -178,6 +190,14 @@ void handlePauseWithMoistureCheck()
       delay(500); // Wait for servo to move up
       servoDown = false;
     }
+    
+    // Make sure pump is off before resuming
+    if (pumpActivated)
+    {
+      deactivatePump();
+      pumpActivated = false;
+    }
+    
     Serial.println("RESUMING - 3 seconds complete");
     isPaused = false;
     checkingMoisture = false;
@@ -199,7 +219,7 @@ void handlePauseWithMoistureCheck()
       }
     }
     // Step 2: Read soil moisture (after servo is down)
-    else if (servoDown && checkingMoisture)
+    else if (servoDown && !pumpActivated)
     {
       if (currentTime - moistureCheckStartTime >= 500)
       { // Wait for servo to settle
@@ -210,27 +230,78 @@ void handlePauseWithMoistureCheck()
         // FIXED LOGIC: Dry if >= 3000, Wet if <= 2600
         if (soilMoisture >= DRY_THRESHOLD)
         {
-          Serial.println("Soil is DRY (>=3000) - Activating pump for 2 seconds");
-          activatePump();
-          delay(2000); // Pump runs for 2 seconds
-          deactivatePump();
-          Serial.println("Pump deactivated");
+          Serial.print("Soil is DRY (>=3000) - Will wait ");
+          Serial.print(PUMP_DELAY_BEFORE_ON / 1000);
+          Serial.println(" seconds before starting pump");
+          
+          // Start the delay timer for pump
+          pumpStartTime = currentTime;
+          pumpActivated = true;
         }
         else if (soilMoisture <= WET_THRESHOLD)
         {
           Serial.println("Soil is WET (<=2600) - No watering needed");
+          // Raise servo back up
+          Serial.println("Raising servo...");
+          myServo.write(SERVO_UP_ANGLE);
+          delay(500);
+          checkingMoisture = false;
         }
         else
         {
           Serial.println("Soil moisture is MODERATE (2601-2999) - No watering needed");
+          // Raise servo back up
+          Serial.println("Raising servo...");
+          myServo.write(SERVO_UP_ANGLE);
+          delay(500);
+          checkingMoisture = false;
         }
-
+      }
+    }
+    // Step 3: Handle pump delay and activation
+    else if (pumpActivated)
+    {
+      unsigned long timeSinceDryDetected = currentTime - pumpStartTime;
+      
+      if (timeSinceDryDetected < PUMP_DELAY_BEFORE_ON)
+      {
+        // Still waiting before turning pump on
+        Serial.print("Waiting ");
+        Serial.print((PUMP_DELAY_BEFORE_ON - timeSinceDryDetected) / 1000);
+        Serial.println(" seconds before starting pump...");
+        delay(100); // Small delay to avoid spamming serial
+      }
+      else if (timeSinceDryDetected >= PUMP_DELAY_BEFORE_ON && 
+               timeSinceDryDetected < (PUMP_DELAY_BEFORE_ON + PUMP_DURATION))
+      {
+        // Pump should be ON
+        if (digitalRead(RELAY_PIN) == LOW) // If pump is not already ON
+        {
+          Serial.println("DELAY COMPLETE - Starting pump NOW!");
+          activatePump();
+        }
+        
+        unsigned long pumpRunningTime = timeSinceDryDetected - PUMP_DELAY_BEFORE_ON;
+        Serial.print("Pump running for: ");
+        Serial.print(pumpRunningTime / 1000);
+        Serial.print(" / ");
+        Serial.print(PUMP_DURATION / 1000);
+        Serial.println(" seconds");
+        delay(100);
+      }
+      else if (timeSinceDryDetected >= (PUMP_DELAY_BEFORE_ON + PUMP_DURATION))
+      {
+        // Pump duration complete - turn off and cleanup
+        Serial.println("Pump duration complete");
+        deactivatePump();
+        
         // Raise servo back up
         Serial.println("Raising servo...");
         myServo.write(SERVO_UP_ANGLE);
-        delay(500); // Wait for servo to move up
-
-        checkingMoisture = false; // Moisture check complete
+        delay(500);
+        
+        pumpActivated = false;
+        checkingMoisture = false;
         Serial.println("Moisture check complete");
       }
     }
@@ -251,14 +322,14 @@ int readSoilMoisture()
 
 void activatePump()
 {
-  digitalWrite(RELAY_PIN, LOW); // Relay ON (Active LOW)
-  Serial.println("PUMP ON");
+  digitalWrite(RELAY_PIN, HIGH); // Relay ON (Active LOW)
+  Serial.println(">>> PUMP IS NOW ON <<<");
 }
 
 void deactivatePump()
 {
-  digitalWrite(RELAY_PIN, HIGH); // Relay OFF
-  Serial.println("PUMP OFF");
+  digitalWrite(RELAY_PIN, LOW); // Relay OFF
+  Serial.println(">>> PUMP IS NOW OFF <<<");
 }
 
 void driveForward()
